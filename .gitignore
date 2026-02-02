@@ -1,0 +1,23 @@
+# Always ignore virtual environments (anywhere)
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+**/env/
+
+# Python cache/bytecode
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Secrets / keys
+test_key.py
+**/test_key.py
+*.key
+*.pem
+.env
+.env.*
+
+# Editor
+.vscode/
