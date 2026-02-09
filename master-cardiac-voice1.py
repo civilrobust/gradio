@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import math
 import time
@@ -66,21 +65,6 @@ SYSTEM_PROMPT_LOCKED = (
     "Never give clinical advice. Assume synthetic demo only.\n"
 )
 
-# A separate voice prompt that forbids symbols/markdown entirely
-VOICE_PROMPT_LOCKED = (
-    "You are a voice narrator for an NHS-style demo.\n"
-    "Convert the provided analysis into natural spoken English.\n"
-    "Rules:\n"
-    "- Do NOT read punctuation like backslashes, asterisks, hashes, braces, brackets, underscores.\n"
-    "- Do NOT output markdown, bullet symbols, tables, code, JSON, or headings with #.\n"
-    "- Expand abbreviations the FIRST time you say them: "
-    "AUC = area under the curve; ROC = receiver operating characteristic; "
-    "FN = false negative; FP = false positive; TP = true positive; TN = true negative; "
-    "ECE = expected calibration error.\n"
-    "- Keep it concise: 60 to 120 seconds of speech.\n"
-    "- Keep it calm, executive-friendly.\n"
-)
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -110,7 +94,7 @@ def ask_llm_locked(user_message: str, context: str, history_messages: List[Dict[
         )
 
     if not user_message or not user_message.strip():
-        return "Type a question (e.g., “What does area under the curve mean?”)."
+        return "Type a question (e.g., “What does AUC mean?”)."
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT_LOCKED}]
 
@@ -135,127 +119,6 @@ def ask_llm_locked(user_message: str, context: str, history_messages: List[Dict[
     txt = _extract_output_text(resp)
     footer = f"\n\n—\nResponse time: {dt_ms} ms • Model: {model_name} • Synthetic demo"
     return (txt + footer).strip()
-
-
-# =============================================================================
-# VOICE SAFE TEXT (no symbols / no markdown / no code)
-# =============================================================================
-_ABBR_MAP = {
-    "AUC": "area under the curve",
-    "ROC": "receiver operating characteristic",
-    "ECE": "expected calibration error",
-    "FN": "false negative",
-    "FP": "false positive",
-    "TP": "true positive",
-    "TN": "true negative",
-    "TNR": "true negative rate",
-    "TPR": "true positive rate",
-    "FPR": "false positive rate",
-    "MAE": "mean absolute error",
-    "RMSE": "root mean squared error",
-}
-
-def _expand_abbr_once(text: str) -> str:
-    # Expand FIRST occurrence only: "AUC (area under the curve)" style
-    for abbr, full in _ABBR_MAP.items():
-        pattern = r"\b" + re.escape(abbr) + r"\b"
-        m = re.search(pattern, text)
-        if m:
-            text = re.sub(pattern, f"{abbr} ({full})", text, count=1)
-    return text
-
-
-def strip_markdown_for_tts(text: str) -> str:
-    """
-    Aggressive sanitizer so TTS won't speak "backslash backslash" "asterisk asterisk" "hash".
-    Keeps sentences, removes code/markdown/json-ish noise.
-    """
-    if not text:
-        return ""
-
-    t = str(text)
-
-    # Remove the footer line used in the UI
-    t = re.sub(r"\n—\n.*$", "", t, flags=re.DOTALL)
-
-    # Remove fenced code blocks
-    t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
-
-    # Remove inline code
-    t = re.sub(r"`[^`]*`", " ", t)
-
-    # Remove markdown links [text](url) -> text
-    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
-
-    # Remove headings like ### Title
-    t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.MULTILINE)
-
-    # Remove bullet markers but keep text
-    t = re.sub(r"^\s*[-•*+]\s+", "", t, flags=re.MULTILINE)
-
-    # Remove table pipes and separator rows
-    t = re.sub(r"\|", " ", t)
-    t = re.sub(r"^\s*:?-{2,}:?\s*$", " ", t, flags=re.MULTILINE)
-
-    # Remove JSON-ish braces/brackets that cause "brace brace"
-    t = t.replace("{", " ").replace("}", " ").replace("[", " ").replace("]", " ")
-
-    # Kill backslashes/underscores/asterisks/hashes
-    t = t.replace("\\", " ").replace("_", " ").replace("*", " ").replace("#", " ")
-
-    # Replace repeated weird tokens (NaN, None, etc.) with spoken-friendly words
-    t = re.sub(r"\bNaN\b", "not available", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bn/?a\b", "not available", t, flags=re.IGNORECASE)
-
-    # Collapse whitespace
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # Expand common abbreviations once
-    t = _expand_abbr_once(t)
-
-    return t
-
-
-def make_voice_summary(answer_text: str, llm_context: str) -> str:
-    """
-    Preferred path: ask model to rewrite for speech.
-    Fallback: sanitizer.
-    """
-    # If no API key, fallback immediately
-    if not client:
-        cleaned = strip_markdown_for_tts(answer_text)
-        if len(cleaned) > 1200:
-            cleaned = cleaned[:1200].rsplit(" ", 1)[0] + "…"
-        return cleaned
-
-    try:
-        model_name = os.getenv("OPENAI_MODEL", MODEL_NAME_DEFAULT)
-        # Give the model the answer and (optionally) a tiny bit of context
-        # but keep it short so it doesn't start dumping structured stuff.
-        user_payload = (
-            "Rewrite this for speech.\n\n"
-            "TEXT TO NARRATE:\n"
-            f"{answer_text}\n"
-        )
-
-        resp = client.responses.create(
-            model=model_name,
-            input=[
-                {"role": "system", "content": VOICE_PROMPT_LOCKED},
-                {"role": "user", "content": user_payload},
-            ],
-        )
-        spoken = _extract_output_text(resp)
-        spoken = strip_markdown_for_tts(spoken)  # still sanitize just in case
-
-        if len(spoken) > 1200:
-            spoken = spoken[:1200].rsplit(" ", 1)[0] + "…"
-        return spoken or strip_markdown_for_tts(answer_text)
-    except Exception:
-        cleaned = strip_markdown_for_tts(answer_text)
-        if len(cleaned) > 1200:
-            cleaned = cleaned[:1200].rsplit(" ", 1)[0] + "…"
-        return cleaned
 
 
 # =============================================================================
@@ -288,6 +151,10 @@ def _run_async(coro):
 
 
 def _last_assistant_text(history: List[Dict[str, str]]) -> str:
+    """
+    Your Chatbot history is a list of dicts: {"role": "...", "content": "..."}.
+    We return the most recent assistant message content.
+    """
     history = history or []
     for m in reversed(history):
         if isinstance(m, dict) and m.get("role") == "assistant":
@@ -297,13 +164,16 @@ def _last_assistant_text(history: List[Dict[str, str]]) -> str:
     return ""
 
 
-def speak_text(text: str, voice: str) -> Tuple[Optional[str], str]:
+def speak_last_answer(history: List[Dict[str, str]], voice: str) -> Tuple[Optional[str], str]:
+    """
+    Returns (audio_filepath, status_text)
+    """
     if not EDGE_TTS_OK:
         return None, "edge-tts not installed. Run:  pip install edge-tts"
 
-    text = (text or "").strip()
+    text = _last_assistant_text(history)
     if not text:
-        return None, "No voice text available yet — generate an explanation first."
+        return None, "No assistant message found yet — generate or ask a question first."
 
     os.makedirs("reports/tts", exist_ok=True)
     fn = os.path.join("reports", "tts", f"tts_{uuid.uuid4().hex}.mp3")
@@ -316,21 +186,16 @@ def speak_text(text: str, voice: str) -> Tuple[Optional[str], str]:
         return None, f"TTS error: {e}"
 
 
-def speak_last_answer(voice_text: str, history: List[Dict[str, str]], voice: str) -> Tuple[Optional[str], str]:
-    """
-    Prefer the pre-built voice-safe summary. If missing, sanitize the last assistant message.
-    """
-    vtxt = (voice_text or "").strip()
-    if not vtxt:
-        fallback = _last_assistant_text(history)
-        vtxt = strip_markdown_for_tts(fallback)
-
-    return speak_text(vtxt, voice)
-
-
 # =============================================================================
 # DATA GENERATION: realistic synthetic cardiac dataset
 # =============================================================================
+CARDIAC_COLS = [
+    "age", "sex", "systolic_bp", "heart_rate", "troponin",
+    "ldl", "egfr", "crp", "chest_pain", "ecg_st", "diabetes",
+    "smoking", "event_30d", "ntprobnp"
+]
+
+
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
 
@@ -343,6 +208,13 @@ def generate_realistic_synthetic(
     missingness: float = 0.10,
     seed: int = 42
 ) -> pd.DataFrame:
+    """
+    Generates a deliberately 'not-too-perfect' synthetic dataset:
+    - correlated features
+    - overlapping classes
+    - missingness in labs/vitals
+    - small label noise (flip %)
+    """
     rng = np.random.default_rng(seed)
 
     n = int(max(50, min(2000, n_rows)))
@@ -540,6 +412,10 @@ def _format_pct(x: Optional[float]) -> str:
 # PLOTTING: FN-HIGHLIGHTED CONFUSION MATRIX + ROC + CALIBRATION
 # =============================================================================
 def plot_confusion_matrix_highlight_fn(cm: np.ndarray, threshold: float, title: str = "Confusion Matrix") -> Optional[str]:
+    """
+    cm is 2x2 with rows=actual [0,1], cols=pred [0,1]
+    FN cell is at [1,0]
+    """
     if not MPL_OK:
         return None
     try:
@@ -615,6 +491,11 @@ def plot_calibration_curve(
     n_bins: int = 10,
     title: str = "Calibration (Reliability) Curve"
 ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """
+    Returns: (image_path, brier_score, ece_approx)
+    - Brier score: mean squared error of probability predictions (lower is better)
+    - ECE approx: weighted average absolute gap between predicted prob and observed freq across bins (lower is better)
+    """
     if not MPL_OK or not SKLEARN_OK:
         return None, None, None
     try:
@@ -623,12 +504,14 @@ def plot_calibration_curve(
 
         frac_pos, mean_pred = calibration_curve(y_true, proba, n_bins=int(n_bins), strategy="quantile")
 
+        # Brier
         brier = None
         try:
             brier = float(brier_score_loss(y_true, proba))
         except Exception:
             brier = None
 
+        # ECE approx (uniform weight approximation with quantile bins)
         ece = None
         try:
             gaps = np.abs(frac_pos - mean_pred)
@@ -789,6 +672,10 @@ def build_top_fn_table(
     threshold: float,
     max_rows: int = 10
 ) -> pd.DataFrame:
+    """
+    Worst misses panel: False Negatives (actual=1, predicted=0).
+    Sort by predicted probability DESC so you see the "near-miss / should-have-caught" cases first.
+    """
     try:
         thr = float(np.clip(threshold, 0.01, 0.99))
         pred = (proba >= thr).astype(int)
@@ -1138,7 +1025,7 @@ def train_regression_baseline(
 
 
 # =============================================================================
-# CONTEXT PACKING for the LLM
+# CONTEXT PACKING for the LLM (fixed: always uses passed dicts)
 # =============================================================================
 def build_llm_context(
     df: Optional[pd.DataFrame],
@@ -1214,11 +1101,11 @@ def _history_append(history: List[Dict[str, str]], role: str, content: str) -> L
     return history
 
 
-def chat(user_message: str, user_context: str, history: List[Dict[str, str]], llm_context: str) -> Tuple[str, List[Dict[str, str]], str]:
+def chat(user_message: str, user_context: str, history: List[Dict[str, str]], llm_context: str) -> Tuple[str, List[Dict[str, str]]]:
     history = history or []
     user_message = (user_message or "").strip()
     if not user_message:
-        return "", history, ""
+        return "", history
 
     merged_context = (llm_context or "").strip()
     if user_context and user_context.strip():
@@ -1227,16 +1114,14 @@ def chat(user_message: str, user_context: str, history: List[Dict[str, str]], ll
     answer = ask_llm_locked(user_message=user_message, context=merged_context, history_messages=history)
     history = _history_append(history, "user", user_message)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=merged_context)
-    return "", history, voice_text
+    return "", history
 
 
-def clear_chat() -> Tuple[List[Dict[str, str]], str]:
-    return [], ""
+def clear_chat() -> List[Dict[str, str]]:
+    return []
 
 
-def explain_current_results(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def explain_current_results(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "Explain the current results for an executive audience.\n"
@@ -1252,12 +1137,10 @@ def explain_current_results(history: List[Dict[str, str]], llm_context: str) -> 
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
-def exec_brief(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def exec_brief(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "Write an executive briefing (max ~12 bullets) describing:\n"
@@ -1271,12 +1154,10 @@ def exec_brief(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Di
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
-def risks_caveats(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def risks_caveats(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "List the main risks / caveats of the current run.\n"
@@ -1291,12 +1172,10 @@ def risks_caveats(history: List[Dict[str, str]], llm_context: str) -> Tuple[List
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
-def improve_next(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def improve_next(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "Recommend next improvements, prioritised.\n"
@@ -1311,9 +1190,7 @@ def improve_next(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
 # =============================================================================
@@ -1422,6 +1299,14 @@ h1, h2, h3, h4, h5, h6, label, .prose {{
   font-weight: 700 !important;
 }}
 
+@media (max-width: 1200px) {{
+  .kpi-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+}}
+
+@media (max-width: 600px) {{
+  .kpi-grid {{ grid-template-columns: repeat(1, minmax(0, 1fr)); }}
+}}
+
 table {{
   color: var(--text) !important;
 }}
@@ -1432,6 +1317,25 @@ thead th {{
 tbody td {{
   background: white !important;
   color: var(--text) !important;
+}}
+
+.ag-theme-alpine,
+.ag-theme-alpine .ag-root-wrapper,
+.ag-theme-alpine .ag-header,
+.ag-theme-alpine .ag-cell {{
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial !important;
+}}
+.ag-theme-alpine .ag-cell,
+.ag-theme-alpine .ag-header-cell {{
+  font-size: 12.5px !important;
+  line-height: 1.25 !important;
+  font-variant-numeric: tabular-nums !important;
+}}
+.ag-theme-alpine .ag-cell {{
+  white-space: nowrap !important;
+}}
+.ag-theme-alpine .ag-header-cell-label {{
+  font-weight: 700 !important;
 }}
 
 [data-testid="dataframe"] table,
@@ -1469,19 +1373,19 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
     <div>
       <div style="font-size:28px; font-weight:900; color:{NHS_DARK}; line-height:1.1;">Clinical ML Tutor</div>
       <div style="margin-top:8px; color:{MUTED}; max-width:980px;">
-        AI partner for exploring a <b>synthetic</b> cardiac dataset — with explainable modelling + plain-English commentary.
+        AI partner for exploring a <b>synthetic</b> cardiac dataset — with explainable modelling + plain-English commentary
+        (<b>demo stance</b>, not clinical advice).
       </div>
       <div class="badge-row">
         <span class="badge"><span class="dot"></span> Synthetic-only guidance</span>
         <span class="badge"><span class="dot"></span> Plain-English explanations</span>
         <span class="badge"><span class="dot"></span> FN (missed events) highlighted</span>
         <span class="badge"><span class="dot"></span> Calibration + Top FN panel</span>
-        <span class="badge"><span class="dot"></span> Voice is <b>speech-safe</b> (no code/no symbols)</span>
       </div>
     </div>
     <div style="text-align:right; color:{MUTED}; font-size:12px;">
       Demo stance<br/>
-      <b>Learning & capability uplift</b>
+      <b>Learning & capability uplift</b> (not clinical advice)
     </div>
   </div>
 </div>
@@ -1493,7 +1397,6 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
     classif_state = gr.State({})
     reg_state = gr.State({})
     llm_context_state = gr.State("")
-    voice_text_state = gr.State("")  # NEW: the thing we speak
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1561,9 +1464,10 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                         gr.Markdown("<div class='section-title'>Calibration (probabilities you can trust?)</div>")
                         with gr.Row():
                             cal_img = gr.Image(value=None, label="Reliability curve", type="filepath")
-                            with gr.Group():
-                                kpi_brier = gr.Textbox(label="Brier score (lower is better)", value="—", interactive=False)
-                                kpi_ece = gr.Textbox(label="ECE approx (lower is better)", value="—", interactive=False)
+                            cal_kpis = gr.Group()
+                        with cal_kpis:
+                            kpi_brier = gr.Textbox(label="Brier score (lower is better)", value="—", interactive=False)
+                            kpi_ece = gr.Textbox(label="ECE approx (lower is better)", value="—", interactive=False)
 
                         gr.Markdown("<div class='section-title'>Coefficients (top drivers)</div>")
                         coef_df = gr.Dataframe(value=pd.DataFrame(), interactive=False, wrap=True)
@@ -1618,10 +1522,10 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
             gr.Markdown("<div class='section-title'>AI Analyst Commentary</div>")
             with gr.Group(elem_classes=["card"]):
                 gr.Markdown(
-                    "<div class='small-muted'>Locked scope: explains the <b>current dataset</b> + <b>current model outputs</b> and caveats.</div>"
+                    "<div class='small-muted'>Locked scope: explains the <b>current dataset</b> + <b>current model outputs</b> and caveats — not a general chatbot.</div>"
                 )
 
-                # Voice panel
+                # Voice panel (NEW)
                 gr.Markdown("<div class='section-title'>Voice (TTS)</div>")
                 with gr.Row():
                     voice_choice = gr.Dropdown(
@@ -1630,13 +1534,9 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                         value=DEFAULT_VOICE,
                         interactive=True
                     )
-                    speak_btn = gr.Button("🔊 Speak executive voice summary", elem_classes=["secondary-btn"])
+                    speak_btn = gr.Button("🔊 Speak last answer", elem_classes=["secondary-btn"])
                 tts_audio = gr.Audio(label="Voice output", type="filepath")
-                tts_status = gr.Textbox(
-                    label="TTS status",
-                    value=("edge-tts ready" if EDGE_TTS_OK else "Install edge-tts: pip install edge-tts"),
-                    interactive=False
-                )
+                tts_status = gr.Textbox(label="TTS status", value=("edge-tts ready" if EDGE_TTS_OK else "Install edge-tts: pip install edge-tts"), interactive=False)
 
                 with gr.Row():
                     btn_exec = gr.Button("Generate executive briefing", elem_classes=["secondary-btn"])
@@ -1655,7 +1555,7 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                 with gr.Row():
                     msg = gr.Textbox(
                         label="Your question",
-                        placeholder="e.g., Why are false negatives dangerous? What does calibration mean? Why log-transform troponin?",
+                        placeholder="e.g., Why is FN dangerous? What does calibration mean? Why log-transform troponin?",
                     )
                 with gr.Row():
                     send = gr.Button("Send", elem_classes=["primary-btn"])
@@ -1663,7 +1563,7 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
 
     gr.Markdown(
         "<div class='small-muted' style='margin-top:10px;'>"
-        "<b>Safety:</b> Synthetic demo only. No patient-identifiable input."
+        "<b>Safety:</b> Synthetic demo only. No patient-identifiable input. Not clinical advice. Designed for learning and analytics capability uplift."
         "</div>"
     )
 
@@ -1924,21 +1824,20 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                  reg_scatter_img, reg_resid_img, reg_hist_img, reg_state, llm_context_state]
     )
 
-    # ---- Wiring: Chat + Buttons (now also update voice_text_state)
-    send.click(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot, voice_text_state])
-    msg.submit(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot, voice_text_state])
+    # ---- Wiring: Chat + Buttons
+    send.click(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot])
+    msg.submit(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot])
+    clear.click(clear_chat, inputs=None, outputs=chatbot)
 
-    clear.click(clear_chat, inputs=None, outputs=[chatbot, voice_text_state])
+    explain_btn.click(explain_current_results, inputs=[chatbot, llm_context_state], outputs=chatbot)
+    btn_exec.click(exec_brief, inputs=[chatbot, llm_context_state], outputs=chatbot)
+    btn_risks.click(risks_caveats, inputs=[chatbot, llm_context_state], outputs=chatbot)
+    btn_improve.click(improve_next, inputs=[chatbot, llm_context_state], outputs=chatbot)
 
-    explain_btn.click(explain_current_results, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-    btn_exec.click(exec_brief, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-    btn_risks.click(risks_caveats, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-    btn_improve.click(improve_next, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-
-    # ---- Wiring: Voice
+    # ---- Wiring: Voice (NEW)
     speak_btn.click(
         speak_last_answer,
-        inputs=[voice_text_state, chatbot, voice_choice],
+        inputs=[chatbot, voice_choice],
         outputs=[tts_audio, tts_status]
     )
 

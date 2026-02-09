@@ -1,0 +1,41 @@
+Clinical ML Tutor — Synthetic Demo Report
+Generated: 2026-02-05 22:08:21
+
+Dataset
+- Rows: 490
+- Columns: 14
+- Event rate (event_30d): 24.3%
+
+Classification — 30-day event risk
+- Decision threshold: 0.50
+- Area under the curve (AUC): 0.757
+- Accuracy: 69.9%
+- Sensitivity (true positive rate): 60.0%
+- Specificity (true negative rate): 73.1%
+- Precision (positive predictive value): 41.9%
+- Confusion matrix counts:
+  • True negatives: 68
+  • False positives: 25
+  • False negatives (missed events): 12
+  • True positives: 18
+- Calibration — Brier score: 0.2025 (lower is better)
+- Calibration — expected calibration error: 0.2248 (lower is better)
+
+Top drivers (logistic regression coefficients)
+- age: increases risk (coef 0.4817)
+- troponin: increases risk (coef 0.2474)
+- systolic blood pressure: increases risk (coef 0.2267)
+- bad cholesterol LDL: increases risk (coef 0.2054)
+- diabetes: increases risk (coef 0.1536)
+- C reactive protein: increases risk (coef 0.1175)
+- estimated glomerular filtration rate: decreases risk (coef -0.1075)
+- chest pain: decreases risk (coef -0.0966)
+
+Notes
+- At threshold 0.50, there are 12 missed events (false negatives).
+
+Regression — lab estimation
+- Target: troponin
+- Mean absolute error (MAE): 0.04723
+- Root mean squared error (RMSE): 0.06961
+- Target is log-transformed internally to handle heavy skew; errors are shown in original units.

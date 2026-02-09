@@ -1,10 +1,8 @@
 import os
-import re
 import json
 import math
 import time
 import uuid
-import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,13 +37,6 @@ try:
 except Exception:
     MPL_OK = False
 
-# Voice (Edge TTS)
-try:
-    import edge_tts
-    EDGE_TTS_OK = True
-except Exception:
-    EDGE_TTS_OK = False
-
 
 # =============================================================================
 # CONFIG
@@ -64,21 +55,6 @@ SYSTEM_PROMPT_LOCKED = (
     "Always include: (1) what we trained, (2) what the metrics mean, (3) top drivers direction,\n"
     "(4) caveats (synthetic, leakage, perfect-metric suspicion), (5) next improvement steps.\n"
     "Never give clinical advice. Assume synthetic demo only.\n"
-)
-
-# A separate voice prompt that forbids symbols/markdown entirely
-VOICE_PROMPT_LOCKED = (
-    "You are a voice narrator for an NHS-style demo.\n"
-    "Convert the provided analysis into natural spoken English.\n"
-    "Rules:\n"
-    "- Do NOT read punctuation like backslashes, asterisks, hashes, braces, brackets, underscores.\n"
-    "- Do NOT output markdown, bullet symbols, tables, code, JSON, or headings with #.\n"
-    "- Expand abbreviations the FIRST time you say them: "
-    "AUC = area under the curve; ROC = receiver operating characteristic; "
-    "FN = false negative; FP = false positive; TP = true positive; TN = true negative; "
-    "ECE = expected calibration error.\n"
-    "- Keep it concise: 60 to 120 seconds of speech.\n"
-    "- Keep it calm, executive-friendly.\n"
 )
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -110,7 +86,7 @@ def ask_llm_locked(user_message: str, context: str, history_messages: List[Dict[
         )
 
     if not user_message or not user_message.strip():
-        return "Type a question (e.g., “What does area under the curve mean?”)."
+        return "Type a question (e.g., “What does AUC mean?”)."
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT_LOCKED}]
 
@@ -138,199 +114,15 @@ def ask_llm_locked(user_message: str, context: str, history_messages: List[Dict[
 
 
 # =============================================================================
-# VOICE SAFE TEXT (no symbols / no markdown / no code)
-# =============================================================================
-_ABBR_MAP = {
-    "AUC": "area under the curve",
-    "ROC": "receiver operating characteristic",
-    "ECE": "expected calibration error",
-    "FN": "false negative",
-    "FP": "false positive",
-    "TP": "true positive",
-    "TN": "true negative",
-    "TNR": "true negative rate",
-    "TPR": "true positive rate",
-    "FPR": "false positive rate",
-    "MAE": "mean absolute error",
-    "RMSE": "root mean squared error",
-}
-
-def _expand_abbr_once(text: str) -> str:
-    # Expand FIRST occurrence only: "AUC (area under the curve)" style
-    for abbr, full in _ABBR_MAP.items():
-        pattern = r"\b" + re.escape(abbr) + r"\b"
-        m = re.search(pattern, text)
-        if m:
-            text = re.sub(pattern, f"{abbr} ({full})", text, count=1)
-    return text
-
-
-def strip_markdown_for_tts(text: str) -> str:
-    """
-    Aggressive sanitizer so TTS won't speak "backslash backslash" "asterisk asterisk" "hash".
-    Keeps sentences, removes code/markdown/json-ish noise.
-    """
-    if not text:
-        return ""
-
-    t = str(text)
-
-    # Remove the footer line used in the UI
-    t = re.sub(r"\n—\n.*$", "", t, flags=re.DOTALL)
-
-    # Remove fenced code blocks
-    t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
-
-    # Remove inline code
-    t = re.sub(r"`[^`]*`", " ", t)
-
-    # Remove markdown links [text](url) -> text
-    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
-
-    # Remove headings like ### Title
-    t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.MULTILINE)
-
-    # Remove bullet markers but keep text
-    t = re.sub(r"^\s*[-•*+]\s+", "", t, flags=re.MULTILINE)
-
-    # Remove table pipes and separator rows
-    t = re.sub(r"\|", " ", t)
-    t = re.sub(r"^\s*:?-{2,}:?\s*$", " ", t, flags=re.MULTILINE)
-
-    # Remove JSON-ish braces/brackets that cause "brace brace"
-    t = t.replace("{", " ").replace("}", " ").replace("[", " ").replace("]", " ")
-
-    # Kill backslashes/underscores/asterisks/hashes
-    t = t.replace("\\", " ").replace("_", " ").replace("*", " ").replace("#", " ")
-
-    # Replace repeated weird tokens (NaN, None, etc.) with spoken-friendly words
-    t = re.sub(r"\bNaN\b", "not available", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bn/?a\b", "not available", t, flags=re.IGNORECASE)
-
-    # Collapse whitespace
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # Expand common abbreviations once
-    t = _expand_abbr_once(t)
-
-    return t
-
-
-def make_voice_summary(answer_text: str, llm_context: str) -> str:
-    """
-    Preferred path: ask model to rewrite for speech.
-    Fallback: sanitizer.
-    """
-    # If no API key, fallback immediately
-    if not client:
-        cleaned = strip_markdown_for_tts(answer_text)
-        if len(cleaned) > 1200:
-            cleaned = cleaned[:1200].rsplit(" ", 1)[0] + "…"
-        return cleaned
-
-    try:
-        model_name = os.getenv("OPENAI_MODEL", MODEL_NAME_DEFAULT)
-        # Give the model the answer and (optionally) a tiny bit of context
-        # but keep it short so it doesn't start dumping structured stuff.
-        user_payload = (
-            "Rewrite this for speech.\n\n"
-            "TEXT TO NARRATE:\n"
-            f"{answer_text}\n"
-        )
-
-        resp = client.responses.create(
-            model=model_name,
-            input=[
-                {"role": "system", "content": VOICE_PROMPT_LOCKED},
-                {"role": "user", "content": user_payload},
-            ],
-        )
-        spoken = _extract_output_text(resp)
-        spoken = strip_markdown_for_tts(spoken)  # still sanitize just in case
-
-        if len(spoken) > 1200:
-            spoken = spoken[:1200].rsplit(" ", 1)[0] + "…"
-        return spoken or strip_markdown_for_tts(answer_text)
-    except Exception:
-        cleaned = strip_markdown_for_tts(answer_text)
-        if len(cleaned) > 1200:
-            cleaned = cleaned[:1200].rsplit(" ", 1)[0] + "…"
-        return cleaned
-
-
-# =============================================================================
-# VOICE (Edge TTS)
-# =============================================================================
-DEFAULT_VOICE = "en-GB-SoniaNeural"
-VOICE_CHOICES = [
-    "en-GB-SoniaNeural",
-    "en-GB-RyanNeural",
-    "en-US-JennyNeural",
-    "en-US-GuyNeural",
-    "en-AU-NatashaNeural",
-    "en-IN-NeerjaNeural",
-]
-
-def _run_async(coro):
-    """
-    Safe coroutine runner for Gradio callbacks.
-    - If no loop is running: asyncio.run
-    - If a loop is running (rare in Gradio threads): create a new loop
-    """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-
-
-def _last_assistant_text(history: List[Dict[str, str]]) -> str:
-    history = history or []
-    for m in reversed(history):
-        if isinstance(m, dict) and m.get("role") == "assistant":
-            txt = str(m.get("content", "")).strip()
-            if txt:
-                return txt
-    return ""
-
-
-def speak_text(text: str, voice: str) -> Tuple[Optional[str], str]:
-    if not EDGE_TTS_OK:
-        return None, "edge-tts not installed. Run:  pip install edge-tts"
-
-    text = (text or "").strip()
-    if not text:
-        return None, "No voice text available yet — generate an explanation first."
-
-    os.makedirs("reports/tts", exist_ok=True)
-    fn = os.path.join("reports", "tts", f"tts_{uuid.uuid4().hex}.mp3")
-
-    v = (voice or DEFAULT_VOICE).strip()
-    try:
-        _run_async(edge_tts.Communicate(text, v).save(fn))
-        return fn, f"Spoken with {v}"
-    except Exception as e:
-        return None, f"TTS error: {e}"
-
-
-def speak_last_answer(voice_text: str, history: List[Dict[str, str]], voice: str) -> Tuple[Optional[str], str]:
-    """
-    Prefer the pre-built voice-safe summary. If missing, sanitize the last assistant message.
-    """
-    vtxt = (voice_text or "").strip()
-    if not vtxt:
-        fallback = _last_assistant_text(history)
-        vtxt = strip_markdown_for_tts(fallback)
-
-    return speak_text(vtxt, voice)
-
-
-# =============================================================================
 # DATA GENERATION: realistic synthetic cardiac dataset
 # =============================================================================
+CARDIAC_COLS = [
+    "age", "sex", "systolic_bp", "heart_rate", "troponin",
+    "ldl", "egfr", "crp", "chest_pain", "ecg_st", "diabetes",
+    "smoking", "event_30d", "ntprobnp"
+]
+
+
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
 
@@ -343,6 +135,13 @@ def generate_realistic_synthetic(
     missingness: float = 0.10,
     seed: int = 42
 ) -> pd.DataFrame:
+    """
+    Generates a deliberately 'not-too-perfect' synthetic dataset:
+    - correlated features
+    - overlapping classes
+    - missingness in labs/vitals
+    - small label noise (flip %)
+    """
     rng = np.random.default_rng(seed)
 
     n = int(max(50, min(2000, n_rows)))
@@ -540,6 +339,10 @@ def _format_pct(x: Optional[float]) -> str:
 # PLOTTING: FN-HIGHLIGHTED CONFUSION MATRIX + ROC + CALIBRATION
 # =============================================================================
 def plot_confusion_matrix_highlight_fn(cm: np.ndarray, threshold: float, title: str = "Confusion Matrix") -> Optional[str]:
+    """
+    cm is 2x2 with rows=actual [0,1], cols=pred [0,1]
+    FN cell is at [1,0]
+    """
     if not MPL_OK:
         return None
     try:
@@ -615,6 +418,11 @@ def plot_calibration_curve(
     n_bins: int = 10,
     title: str = "Calibration (Reliability) Curve"
 ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """
+    Returns: (image_path, brier_score, ece_approx)
+    - Brier score: mean squared error of probability predictions (lower is better)
+    - ECE approx: weighted average absolute gap between predicted prob and observed freq across bins (lower is better)
+    """
     if not MPL_OK or not SKLEARN_OK:
         return None, None, None
     try:
@@ -623,12 +431,14 @@ def plot_calibration_curve(
 
         frac_pos, mean_pred = calibration_curve(y_true, proba, n_bins=int(n_bins), strategy="quantile")
 
+        # Brier
         brier = None
         try:
             brier = float(brier_score_loss(y_true, proba))
         except Exception:
             brier = None
 
+        # ECE approx (uniform weight approximation with quantile bins)
         ece = None
         try:
             gaps = np.abs(frac_pos - mean_pred)
@@ -789,6 +599,10 @@ def build_top_fn_table(
     threshold: float,
     max_rows: int = 10
 ) -> pd.DataFrame:
+    """
+    Worst misses panel: False Negatives (actual=1, predicted=0).
+    Sort by predicted probability DESC so you see the "near-miss / should-have-caught" cases first.
+    """
     try:
         thr = float(np.clip(threshold, 0.01, 0.99))
         pred = (proba >= thr).astype(int)
@@ -802,6 +616,7 @@ def build_top_fn_table(
         rows.insert(0, "threshold", thr)
         rows.insert(0, "predicted_risk", proba[fn_idx])
 
+        # Sort: highest predicted risk first
         rows = rows.sort_values("predicted_risk", ascending=False).head(int(max_rows))
         rows["predicted_risk"] = rows["predicted_risk"].round(4)
         return rows.reset_index(drop=True)
@@ -903,6 +718,7 @@ def train_baseline_logreg(
 
     proba = pipe.predict_proba(X_test)[:, 1]
 
+    # AUC
     try:
         auc = roc_auc_score(y_test, proba) if y_test.nunique() == 2 else None
     except Exception:
@@ -922,6 +738,7 @@ def train_baseline_logreg(
     m = _binary_metrics_from_counts(tp=tp, fp=fp, fn=fn, tn=tn)
     acc_thr = m.get("accuracy", None)
 
+    # Coefficients
     clf = pipe.named_steps["clf"]
     coefs = clf.coef_.reshape(-1)
     coef_df = pd.DataFrame({"feature": features, "coef": coefs})
@@ -933,9 +750,11 @@ def train_baseline_logreg(
     top_coef = top_coef[["feature", "coef", "direction"]]
     top_coef["coef"] = top_coef["coef"].round(4)
 
+    # Plots
     roc_path = plot_roc_curve(np.array(y_test), np.array(proba)) if (MPL_OK and auc_f is not None) else None
     cm_path = plot_confusion_matrix_highlight_fn(cm, threshold=threshold, title="Confusion Matrix (FN highlighted)") if MPL_OK else None
 
+    # Calibration
     cal_path, brier, ece = plot_calibration_curve(
         y_true=np.array(y_test),
         proba=np.array(proba),
@@ -943,6 +762,7 @@ def train_baseline_logreg(
         title="Calibration (Reliability) Curve"
     )
 
+    # Top FN table
     fn_table = build_top_fn_table(
         x_test=X_test,
         y_test=np.array(y_test),
@@ -951,6 +771,7 @@ def train_baseline_logreg(
         max_rows=int(max(5, min(50, top_fn_n)))
     )
 
+    # Perfect-metric suspicion
     if auc_f is not None and auc_f >= 0.98:
         notes.append(
             "AUC is extremely high. In real-world clinical data this is unusual; it may indicate synthetic rules are too clean, "
@@ -961,12 +782,14 @@ def train_baseline_logreg(
             "Accuracy is extremely high. Treat as a demo indicator; check for leakage and increase overlap/noise in synthetic generation."
         )
 
+    # FN callout
     if fn > 0:
         notes.append(
             f"Safety note: FN (missed events) at threshold {threshold:.2f} = {fn}. "
             "In cardiac screening, FN is usually the most clinically concerning error type."
         )
 
+    # Calibration callout
     if brier is not None:
         notes.append(f"Calibration note: Brier score = {brier:.4f} (lower is better).")
     if ece is not None:
@@ -1005,6 +828,10 @@ def recalc_threshold_metrics_and_tables(
     top_fn_n: int = 10,
     cal_bins: int = 10
 ) -> Tuple[Dict[str, Any], Optional[str], pd.DataFrame, Optional[str], Optional[float], Optional[float]]:
+    """
+    Recalculate confusion matrix + metrics + FN table + calibration plot for a new threshold, without retraining.
+    Returns: metrics_dict, cm_path, fn_table, cal_path, brier, ece
+    """
     threshold = float(np.clip(threshold, 0.01, 0.99))
     pred = (proba >= threshold).astype(int)
     cm = confusion_matrix(y_test, pred, labels=[0, 1])
@@ -1013,6 +840,7 @@ def recalc_threshold_metrics_and_tables(
 
     cm_path = plot_confusion_matrix_highlight_fn(cm, threshold=threshold, title="Confusion Matrix (FN highlighted)") if MPL_OK else None
 
+    # FN table depends on threshold
     fn_table = build_top_fn_table(
         x_test=x_test,
         y_test=y_test,
@@ -1021,6 +849,7 @@ def recalc_threshold_metrics_and_tables(
         max_rows=int(max(5, min(50, top_fn_n)))
     )
 
+    # Calibration does NOT depend on threshold (it’s about probabilities), but we re-render so it stays fresh visually.
     cal_path, brier, ece = plot_calibration_curve(
         y_true=y_test,
         proba=proba,
@@ -1047,6 +876,14 @@ def _prepare_regression_xy(
     target_col: str,
     features: List[str],
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str]]:
+    """
+    Returns X, y_log, used_features, notes
+    Uses:
+      - drop rows with missing target
+      - numeric coercion
+      - median impute for X
+      - log1p transform on y (skewed labs), returned y is transformed (model-space)
+    """
     notes = []
     if target_col not in df.columns:
         return pd.DataFrame(), pd.Series(dtype=float), [], [f"Target '{target_col}' not found."]
@@ -1138,7 +975,7 @@ def train_regression_baseline(
 
 
 # =============================================================================
-# CONTEXT PACKING for the LLM
+# CONTEXT PACKING for the LLM (fixed: always uses passed dicts)
 # =============================================================================
 def build_llm_context(
     df: Optional[pd.DataFrame],
@@ -1159,6 +996,7 @@ def build_llm_context(
         parts.append("NUMERIC STATS (first 10 features):")
         parts.append(head.to_json(orient="records"))
 
+    # Classification
     if classif_state and isinstance(classif_state, dict) and classif_state.get("trained"):
         parts.append("")
         parts.append("CLASSIFICATION OUTPUTS (current run):")
@@ -1187,6 +1025,7 @@ def build_llm_context(
         parts.append("")
         parts.append("CLASSIFICATION OUTPUTS: none (model not trained yet).")
 
+    # Regression
     if reg_state and isinstance(reg_state, dict) and reg_state.get("trained"):
         parts.append("")
         parts.append("REGRESSION OUTPUTS (current run):")
@@ -1214,11 +1053,11 @@ def _history_append(history: List[Dict[str, str]], role: str, content: str) -> L
     return history
 
 
-def chat(user_message: str, user_context: str, history: List[Dict[str, str]], llm_context: str) -> Tuple[str, List[Dict[str, str]], str]:
+def chat(user_message: str, user_context: str, history: List[Dict[str, str]], llm_context: str) -> Tuple[str, List[Dict[str, str]]]:
     history = history or []
     user_message = (user_message or "").strip()
     if not user_message:
-        return "", history, ""
+        return "", history
 
     merged_context = (llm_context or "").strip()
     if user_context and user_context.strip():
@@ -1227,16 +1066,14 @@ def chat(user_message: str, user_context: str, history: List[Dict[str, str]], ll
     answer = ask_llm_locked(user_message=user_message, context=merged_context, history_messages=history)
     history = _history_append(history, "user", user_message)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=merged_context)
-    return "", history, voice_text
+    return "", history
 
 
-def clear_chat() -> Tuple[List[Dict[str, str]], str]:
-    return [], ""
+def clear_chat() -> List[Dict[str, str]]:
+    return []
 
 
-def explain_current_results(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def explain_current_results(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "Explain the current results for an executive audience.\n"
@@ -1252,12 +1089,10 @@ def explain_current_results(history: List[Dict[str, str]], llm_context: str) -> 
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
-def exec_brief(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def exec_brief(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "Write an executive briefing (max ~12 bullets) describing:\n"
@@ -1271,12 +1106,10 @@ def exec_brief(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Di
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
-def risks_caveats(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def risks_caveats(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "List the main risks / caveats of the current run.\n"
@@ -1291,12 +1124,10 @@ def risks_caveats(history: List[Dict[str, str]], llm_context: str) -> Tuple[List
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
-def improve_next(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[Dict[str, str]], str]:
+def improve_next(history: List[Dict[str, str]], llm_context: str) -> List[Dict[str, str]]:
     history = history or []
     prompt = (
         "Recommend next improvements, prioritised.\n"
@@ -1311,9 +1142,7 @@ def improve_next(history: List[Dict[str, str]], llm_context: str) -> Tuple[List[
     )
     answer = ask_llm_locked(user_message=prompt, context=llm_context or "", history_messages=history)
     history = _history_append(history, "assistant", answer)
-
-    voice_text = make_voice_summary(answer, llm_context=llm_context or "")
-    return history, voice_text
+    return history
 
 
 # =============================================================================
@@ -1422,6 +1251,39 @@ h1, h2, h3, h4, h5, h6, label, .prose {{
   font-weight: 700 !important;
 }}
 
+.kpi-grid {{
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+}}
+
+.kpi {{
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.85);
+}}
+
+.kpi .label {{
+  font-size: 12px;
+  color: var(--muted);
+}}
+
+.kpi .value {{
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--text);
+  margin-top: 4px;
+}}
+
+@media (max-width: 1200px) {{
+  .kpi-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+}}
+
+@media (max-width: 600px) {{
+  .kpi-grid {{ grid-template-columns: repeat(1, minmax(0, 1fr)); }}
+}}
+
 table {{
   color: var(--text) !important;
 }}
@@ -1434,6 +1296,28 @@ tbody td {{
   color: var(--text) !important;
 }}
 
+/* ---- Dataframe polish: remove "typewriter" vibe + stop wraps ---- */
+/* Newer Gradio often uses ag-grid */
+.ag-theme-alpine,
+.ag-theme-alpine .ag-root-wrapper,
+.ag-theme-alpine .ag-header,
+.ag-theme-alpine .ag-cell {{
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial !important;
+}}
+.ag-theme-alpine .ag-cell, 
+.ag-theme-alpine .ag-header-cell {{
+  font-size: 12.5px !important;
+  line-height: 1.25 !important;
+  font-variant-numeric: tabular-nums !important;
+}}
+.ag-theme-alpine .ag-cell {{
+  white-space: nowrap !important;
+}}
+.ag-theme-alpine .ag-header-cell-label {{
+  font-weight: 700 !important;
+}}
+
+/* Fallback (if it renders as plain table inside dataframe container) */
 [data-testid="dataframe"] table,
 [data-testid="dataframe"] th,
 [data-testid="dataframe"] td {{
@@ -1446,12 +1330,14 @@ tbody td {{
   white-space: nowrap !important;
 }}
 
+/* Make dataframe containers feel nicer: scroll instead of wrap */
 [data-testid="dataframe"] {{
   max-height: 360px;
   overflow: auto;
   border-radius: 12px;
 }}
 
+/* ---- Chat panel: bigger + less cramped ---- */
 [data-testid="chatbot"] {{
   min-height: 740px !important;
 }}
@@ -1469,19 +1355,19 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
     <div>
       <div style="font-size:28px; font-weight:900; color:{NHS_DARK}; line-height:1.1;">Clinical ML Tutor</div>
       <div style="margin-top:8px; color:{MUTED}; max-width:980px;">
-        AI partner for exploring a <b>synthetic</b> cardiac dataset — with explainable modelling + plain-English commentary.
+        AI partner for exploring a <b>synthetic</b> cardiac dataset — with explainable modelling + plain-English commentary
+        (<b>demo stance</b>, not clinical advice).
       </div>
       <div class="badge-row">
         <span class="badge"><span class="dot"></span> Synthetic-only guidance</span>
         <span class="badge"><span class="dot"></span> Plain-English explanations</span>
         <span class="badge"><span class="dot"></span> FN (missed events) highlighted</span>
         <span class="badge"><span class="dot"></span> Calibration + Top FN panel</span>
-        <span class="badge"><span class="dot"></span> Voice is <b>speech-safe</b> (no code/no symbols)</span>
       </div>
     </div>
     <div style="text-align:right; color:{MUTED}; font-size:12px;">
       Demo stance<br/>
-      <b>Learning & capability uplift</b>
+      <b>Learning & capability uplift</b> (not clinical advice)
     </div>
   </div>
 </div>
@@ -1493,7 +1379,6 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
     classif_state = gr.State({})
     reg_state = gr.State({})
     llm_context_state = gr.State("")
-    voice_text_state = gr.State("")  # NEW: the thing we speak
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1561,9 +1446,10 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                         gr.Markdown("<div class='section-title'>Calibration (probabilities you can trust?)</div>")
                         with gr.Row():
                             cal_img = gr.Image(value=None, label="Reliability curve", type="filepath")
-                            with gr.Group():
-                                kpi_brier = gr.Textbox(label="Brier score (lower is better)", value="—", interactive=False)
-                                kpi_ece = gr.Textbox(label="ECE approx (lower is better)", value="—", interactive=False)
+                            cal_kpis = gr.Group()
+                        with cal_kpis:
+                            kpi_brier = gr.Textbox(label="Brier score (lower is better)", value="—", interactive=False)
+                            kpi_ece = gr.Textbox(label="ECE approx (lower is better)", value="—", interactive=False)
 
                         gr.Markdown("<div class='section-title'>Coefficients (top drivers)</div>")
                         coef_df = gr.Dataframe(value=pd.DataFrame(), interactive=False, wrap=True)
@@ -1614,28 +1500,12 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                             reg_resid_img = gr.Image(value=None, label="Residuals (Error vs Actual)", type="filepath")
                         reg_hist_img = gr.Image(value=None, label="Error distribution", type="filepath")
 
+        # Right column now slightly wider, and chat is taller.
         with gr.Column(scale=1.15):
             gr.Markdown("<div class='section-title'>AI Analyst Commentary</div>")
             with gr.Group(elem_classes=["card"]):
                 gr.Markdown(
-                    "<div class='small-muted'>Locked scope: explains the <b>current dataset</b> + <b>current model outputs</b> and caveats.</div>"
-                )
-
-                # Voice panel
-                gr.Markdown("<div class='section-title'>Voice (TTS)</div>")
-                with gr.Row():
-                    voice_choice = gr.Dropdown(
-                        label="Voice",
-                        choices=VOICE_CHOICES,
-                        value=DEFAULT_VOICE,
-                        interactive=True
-                    )
-                    speak_btn = gr.Button("🔊 Speak executive voice summary", elem_classes=["secondary-btn"])
-                tts_audio = gr.Audio(label="Voice output", type="filepath")
-                tts_status = gr.Textbox(
-                    label="TTS status",
-                    value=("edge-tts ready" if EDGE_TTS_OK else "Install edge-tts: pip install edge-tts"),
-                    interactive=False
+                    "<div class='small-muted'>Locked scope: explains the <b>current dataset</b> + <b>current model outputs</b> and caveats — not a general chatbot.</div>"
                 )
 
                 with gr.Row():
@@ -1655,7 +1525,7 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                 with gr.Row():
                     msg = gr.Textbox(
                         label="Your question",
-                        placeholder="e.g., Why are false negatives dangerous? What does calibration mean? Why log-transform troponin?",
+                        placeholder="e.g., Why is FN dangerous? What does calibration mean? Why log-transform troponin?",
                     )
                 with gr.Row():
                     send = gr.Button("Send", elem_classes=["primary-btn"])
@@ -1663,7 +1533,7 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
 
     gr.Markdown(
         "<div class='small-muted' style='margin-top:10px;'>"
-        "<b>Safety:</b> Synthetic demo only. No patient-identifiable input."
+        "<b>Safety:</b> Synthetic demo only. No patient-identifiable input. Not clinical advice. Designed for learning and analytics capability uplift."
         "</div>"
     )
 
@@ -1779,6 +1649,7 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
         fn_sentence_txt = f"At threshold {snap.threshold:.2f}, the model missed {snap.fn} out of {true_events} true events." if true_events > 0 else "—"
         cave = "\n".join([f"- {n}" for n in (snap.notes or [])]) if (snap.notes) else ""
 
+        # state (serialisable)
         state = {
             "trained": True,
             "target": snap.target,
@@ -1798,9 +1669,11 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
             "notes": snap.notes or [],
             "top_coef": snap.top_coef.to_dict(orient="records") if isinstance(snap.top_coef, pd.DataFrame) else [],
             "top_fn_table": snap.fn_table.to_dict(orient="records") if isinstance(snap.fn_table, pd.DataFrame) else [],
+            # arrays + X_test for future threshold updates
             "y_test": snap.y_test.tolist() if snap.y_test is not None else [],
             "proba_test": snap.proba_test.tolist() if snap.proba_test is not None else [],
             "x_test": snap.x_test.to_dict(orient="list") if isinstance(snap.x_test, pd.DataFrame) else {},
+            # plot paths
             "roc_path": snap.roc_path,
             "cm_path": snap.cm_path,
             "cal_path": snap.cal_path,
@@ -1924,23 +1797,15 @@ with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
                  reg_scatter_img, reg_resid_img, reg_hist_img, reg_state, llm_context_state]
     )
 
-    # ---- Wiring: Chat + Buttons (now also update voice_text_state)
-    send.click(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot, voice_text_state])
-    msg.submit(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot, voice_text_state])
+    # ---- Wiring: Chat + Buttons
+    send.click(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot])
+    msg.submit(chat, inputs=[msg, user_context, chatbot, llm_context_state], outputs=[msg, chatbot])
+    clear.click(clear_chat, inputs=None, outputs=chatbot)
 
-    clear.click(clear_chat, inputs=None, outputs=[chatbot, voice_text_state])
-
-    explain_btn.click(explain_current_results, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-    btn_exec.click(exec_brief, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-    btn_risks.click(risks_caveats, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-    btn_improve.click(improve_next, inputs=[chatbot, llm_context_state], outputs=[chatbot, voice_text_state])
-
-    # ---- Wiring: Voice
-    speak_btn.click(
-        speak_last_answer,
-        inputs=[voice_text_state, chatbot, voice_choice],
-        outputs=[tts_audio, tts_status]
-    )
+    explain_btn.click(explain_current_results, inputs=[chatbot, llm_context_state], outputs=chatbot)
+    btn_exec.click(exec_brief, inputs=[chatbot, llm_context_state], outputs=chatbot)
+    btn_risks.click(risks_caveats, inputs=[chatbot, llm_context_state], outputs=chatbot)
+    btn_improve.click(improve_next, inputs=[chatbot, llm_context_state], outputs=chatbot)
 
 
 if __name__ == "__main__":
