@@ -1,23 +1,36 @@
-# Always ignore virtual environments (anywhere)
-.venv/
-**/.venv/
-venv/
-**/venv/
-env/
-**/env/
-
-# Python cache/bytecode
+# ===== Python =====
 __pycache__/
-**/__pycache__/
 *.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Secrets / keys
-test_key.py
-**/test_key.py
-*.key
-*.pem
-.env
-.env.*
+# ===== Virtual env =====
+.venv/
+venv/
+ENV/
+env/
 
-# Editor
+# ===== VS Code =====
 .vscode/
+
+# ===== OS junk =====
+.DS_Store
+Thumbs.db
+
+# ===== Gradio / app generated =====
+.gradio/
+
+# Reports & generated datasets (keep your source CSVs if any)
+reports/
+
+# Generated TTS / audio artifacts
+tts_*.mp3
+voice_test*.mp3
+*.wav
